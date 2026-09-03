@@ -1,0 +1,17 @@
+{
+  "name": "spitz-x-api",
+  "version": "3.0.0",
+  "private": true,
+  "type": "commonjs",
+  "engines": {
+    "node": ">=22 <25"
+  },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^5.1.0",
+    "multer": "^2.0.2"
+  }
+}
