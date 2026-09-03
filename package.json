@@ -1,13 +1,13 @@
 {
   "name": "spitz-x-api",
-  "version": "2.1.0",
-  "description": "SPITz-X Media API",
-  "main": "server.js",
-  "scripts": {
-    "start": "node server.js"
-  },
+  "version": "2.3.0",
+  "private": true,
+  "type": "commonjs",
   "engines": {
     "node": ">=22 <25"
+  },
+  "scripts": {
+    "start": "node server.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
