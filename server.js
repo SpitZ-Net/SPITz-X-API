@@ -1,1165 +1,599 @@
 const express = require("express");
 const cors = require("cors");
+const multer = require("multer");
 const fs = require("fs");
 const fsp = require("fs/promises");
 const path = require("path");
-const os = require("os");
 const crypto = require("crypto");
-const { execFile } = require("child_process");
-const multer = require("multer");
+const { spawn } = require("child_process");
 
 const app = express();
 
-const PORT = process.env.PORT || 10000;
-const API_VERSION = "2.1.0";
+const PORT = Number(process.env.PORT || 10000);
+const MAX_UPLOAD = 250 * 1024 * 1024;
+const TTL = 15 * 60 * 1000;
 
-const MAX_UPLOAD_BYTES = 250 * 1024 * 1024;
-const MAX_CONCURRENT_JOBS = 1;
-const FILE_LIFETIME_MS = 15 * 60 * 1000;
-
-const MEDIA_ROOT = path.join(
-  os.tmpdir(),
-  "spitz-x-media"
-);
-
+const tempRoot = "/tmp/spitz-x-media";
 const jobs = new Map();
 
-let activeJobs = 0;
+fs.mkdirSync(tempRoot, { recursive: true });
 
+app.use(cors({ origin: true }));
+app.use(express.json({ limit: "1mb" }));
 
-/* =========================================================
-   BASIC CONFIG
-========================================================= */
-
-app.disable("x-powered-by");
-
-app.use(
-  cors({
-    origin: "*",
-    methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type"]
-  })
-);
-
-app.use(
-  express.json({
-    limit: "32kb"
-  })
-);
-
-
-/* =========================================================
-   STARTUP
-========================================================= */
-
-async function initialize() {
-  await fsp.mkdir(MEDIA_ROOT, {
-    recursive: true
-  });
-
-  console.log(
-    "SPITz-X media directory:",
-    MEDIA_ROOT
-  );
-}
-
-initialize().catch(error => {
-  console.error(
-    "Startup error:",
-    error
-  );
-});
-
-
-/* =========================================================
-   MULTER UPLOAD CONFIG
-========================================================= */
+/* --------------------------------------------------
+   UPLOAD CONFIG
+-------------------------------------------------- */
 
 const upload = multer({
-  dest: path.join(
-    MEDIA_ROOT,
-    "uploads"
-  ),
-
-  limits: {
-    fileSize: MAX_UPLOAD_BYTES,
-    files: 1
-  },
-
-  fileFilter: (req, file, callback) => {
-
-    const allowedMimeTypes = [
-      "video/mp4",
-      "video/webm",
-      "video/quicktime",
-      "video/x-matroska",
-      "video/x-msvideo",
-      "video/mpeg"
-    ];
-
-    if (
-      allowedMimeTypes.includes(
-        file.mimetype
-      )
-    ) {
-      callback(null, true);
-      return;
+    dest: tempRoot,
+    limits: {
+        fileSize: MAX_UPLOAD,
+        files: 1
+    },
+    fileFilter: (req, file, cb) => {
+        if (/^video\//i.test(file.mimetype)) {
+            cb(null, true);
+        } else {
+            cb(new Error("Only video files are allowed."));
+        }
     }
-
-    callback(
-      new Error(
-        "Unsupported video format."
-      )
-    );
-  }
 });
 
+/* --------------------------------------------------
+   YOUTUBE URL PARSER
+-------------------------------------------------- */
 
-/* =========================================================
+function youtubeId(raw) {
+    try {
+        const u = new URL(raw);
+
+        const host = u.hostname
+            .replace(/^www\./, "")
+            .toLowerCase();
+
+        // youtube.com/watch?v=
+        if (
+            (host === "youtube.com" || host === "m.youtube.com") &&
+            u.pathname === "/watch"
+        ) {
+            return u.searchParams.get("v");
+        }
+
+        // youtu.be/VIDEO_ID
+        if (host === "youtu.be") {
+            return u.pathname.slice(1).split("/")[0] || null;
+        }
+
+        // youtube.com/shorts/VIDEO_ID
+        if (
+            host === "youtube.com" &&
+            u.pathname.startsWith("/shorts/")
+        ) {
+            return u.pathname.split("/")[2] || null;
+        }
+
+        // youtube.com/embed/VIDEO_ID
+        if (
+            host === "youtube.com" &&
+            u.pathname.startsWith("/embed/")
+        ) {
+            return u.pathname.split("/")[2] || null;
+        }
+
+        return null;
+    } catch {
+        return null;
+    }
+}
+
+/* --------------------------------------------------
+   JOB CLEANUP
+-------------------------------------------------- */
+
+function cleanupJob(id) {
+    const job = jobs.get(id);
+
+    if (!job) return;
+
+    jobs.delete(id);
+
+    for (const file of [job.input, job.output]) {
+        if (file) {
+            fs.rm(file, { force: true }, () => {});
+        }
+    }
+
+    if (job.directory) {
+        fs.rm(job.directory, {
+            recursive: true,
+            force: true
+        }).catch(() => {});
+    }
+}
+
+/* --------------------------------------------------
+   FFMPEG
+-------------------------------------------------- */
+
+function runFfmpeg(input, output) {
+    return new Promise((resolve, reject) => {
+        const args = [
+            "-y",
+            "-i",
+            input,
+
+            "-c:v",
+            "libx264",
+
+            "-preset",
+            "veryfast",
+
+            "-crf",
+            "23",
+
+            "-c:a",
+            "aac",
+
+            "-b:a",
+            "128k",
+
+            "-movflags",
+            "+faststart",
+
+            output
+        ];
+
+        const process = spawn("ffmpeg", args, {
+            stdio: ["ignore", "ignore", "pipe"]
+        });
+
+        let errorText = "";
+
+        process.stderr.on("data", data => {
+            errorText += data.toString();
+
+            if (errorText.length > 8000) {
+                errorText = errorText.slice(-8000);
+            }
+        });
+
+        process.on("error", reject);
+
+        process.on("close", code => {
+            if (code === 0) {
+                resolve();
+            } else {
+                reject(
+                    new Error(
+                        "FFmpeg failed:\n" + errorText
+                    )
+                );
+            }
+        });
+    });
+}
+
+/* --------------------------------------------------
    ROOT
-========================================================= */
+-------------------------------------------------- */
 
 app.get("/", (req, res) => {
+    res.json({
+        name: "SPITz-X API",
+        status: "online",
+        version: "2.3.0",
 
-  res.json({
-    name: "SPITz-X API",
-    status: "online",
-    version: API_VERSION,
-
-    services: {
-      analyze: "/analyze",
-      process: "/process",
-      playback: "/playback",
-      convert: "/convert",
-      media: "/media/:jobId",
-      health: "/health"
-    }
-  });
-
+        services: {
+            analyze: "/analyze",
+            process: "/process",
+            convert: "/convert",
+            playback: "/playback/:jobId",
+            media: "/media/:jobId",
+            download: "/download/:jobId",
+            lookup: "/media/by-video/:videoId",
+            health: "/health"
+        }
+    });
 });
 
-
-/* =========================================================
+/* --------------------------------------------------
    HEALTH
-========================================================= */
+-------------------------------------------------- */
 
 app.get("/health", (req, res) => {
-
-  res.json({
-    status: "ok",
-    service: "SPITz-X API",
-    version: API_VERSION,
-
-    processor: "ffmpeg",
-
-    activeJobs: activeJobs,
-
-    maxConcurrentJobs:
-      MAX_CONCURRENT_JOBS,
-
-    maxUploadMB:
-      MAX_UPLOAD_BYTES /
-      1024 /
-      1024
-  });
-
+    res.json({
+        status: "ok",
+        service: "SPITz-X API",
+        version: "2.3.0",
+        processor: "ffmpeg",
+        activeJobs: jobs.size,
+        maxUploadMB: 250
+    });
 });
 
-
-/* =========================================================
-   YOUTUBE HELPERS
-========================================================= */
-
-function getYouTubeVideoId(value) {
-
-  try {
-
-    const url =
-      new URL(value);
-
-    const hostname =
-      url.hostname
-        .toLowerCase()
-        .replace(/^www\./, "");
-
-    if (
-      hostname === "youtu.be"
-    ) {
-
-      const id =
-        url.pathname
-          .split("/")
-          .filter(Boolean)[0];
-
-      return id || null;
-    }
-
-    if (
-      hostname !== "youtube.com" &&
-      hostname !== "m.youtube.com"
-    ) {
-      return null;
-    }
-
-    if (
-      url.pathname === "/watch"
-    ) {
-
-      return (
-        url.searchParams.get("v") ||
-        null
-      );
-    }
-
-    if (
-      url.pathname.startsWith("/shorts/")
-    ) {
-
-      return (
-        url.pathname
-          .split("/")
-          .filter(Boolean)[1] ||
-        null
-      );
-    }
-
-    if (
-      url.pathname.startsWith("/embed/")
-    ) {
-
-      return (
-        url.pathname
-          .split("/")
-          .filter(Boolean)[1] ||
-        null
-      );
-    }
-
-    return null;
-
-  } catch {
-
-    return null;
-
-  }
-
-}
-
-
-function isYouTubeURL(value) {
-
-  return Boolean(
-    getYouTubeVideoId(value)
-  );
-
-}
-
-
-/* =========================================================
-   GENERAL HELPERS
-========================================================= */
-
-function createJob() {
-
-  const id =
-    crypto.randomUUID();
-
-  const directory =
-    path.join(
-      MEDIA_ROOT,
-      id
-    );
-
-  return {
-    id,
-    directory,
-    createdAt: Date.now(),
-    file: null,
-    filename: null
-  };
-
-}
-
-
-async function cleanupJob(jobId) {
-
-  const job =
-    jobs.get(jobId);
-
-  if (!job) {
-    return;
-  }
-
-  try {
-
-    await fsp.rm(
-      job.directory,
-      {
-        recursive: true,
-        force: true
-      }
-    );
-
-  } catch (error) {
-
-    console.error(
-      "Cleanup error:",
-      error.message
-    );
-
-  }
-
-  jobs.delete(jobId);
-
-}
-
-
-function scheduleCleanup(jobId) {
-
-  setTimeout(
-    () => {
-      cleanupJob(jobId);
-    },
-    FILE_LIFETIME_MS
-  );
-
-}
-
-
-function safeFilename(value) {
-
-  return String(value)
-
-    .replace(
-      /[<>:"/\\|?*\x00-\x1F]/g,
-      "_"
-    )
-
-    .replace(
-      /\s+/g,
-      " "
-    )
-
-    .trim()
-
-    .slice(
-      0,
-      180
-    ) ||
-
-    "spitz-x-video.mp4";
-
-}
-
-
-function publicMediaURL(req, jobId) {
-
-  return (
-    `${req.protocol}://${req.get("host")}` +
-    `/media/${encodeURIComponent(jobId)}`
-  );
-
-}
-
-
-function runFFmpeg(
-  input,
-  output
-) {
-
-  return new Promise(
-    (resolve, reject) => {
-
-      const args = [
-
-        "-y",
-
-        "-i",
-        input,
-
-        "-c:v",
-        "libx264",
-
-        "-preset",
-        "veryfast",
-
-        "-crf",
-        "23",
-
-        "-c:a",
-        "aac",
-
-        "-b:a",
-        "128k",
-
-        "-movflags",
-        "+faststart",
-
-        output
-
-      ];
-
-      execFile(
-        "ffmpeg",
-        args,
-
-        {
-          timeout:
-            10 * 60 * 1000,
-
-          maxBuffer:
-            8 * 1024 * 1024
-        },
-
-        (
-          error,
-          stdout,
-          stderr
-        ) => {
-
-          if (error) {
-
-            error.stdout =
-              stdout;
-
-            error.stderr =
-              stderr;
-
-            reject(error);
-
-            return;
-
-          }
-
-          resolve({
-            stdout,
-            stderr
-          });
-
-        }
-      );
-
-    }
-  );
-
-}
-
-
-function friendlyError(error) {
-
-  const output =
-    (
-      error?.stderr ||
-      error?.stdout ||
-      error?.message ||
-      ""
-    )
-    .toString()
-    .trim();
-
-  if (
-    output.length > 1200
-  ) {
-
-    return output.slice(
-      -1200
-    );
-
-  }
-
-  return (
-    output ||
-    "Media processing failed."
-  );
-
-}
-
-
-/* =========================================================
-   YOUTUBE ANALYZE
-========================================================= */
-
-/*
-   This does NOT download the YouTube video.
-
-   It asks YouTube's public oEmbed endpoint
-   for basic metadata.
-*/
-
-app.post(
-  "/analyze",
-  async (req, res) => {
-
-    const input =
-      req.body?.url;
-
-    if (
-      typeof input !== "string" ||
-      !input.trim()
-    ) {
-
-      return res
-        .status(400)
-        .json({
-          success: false,
-          error: "Missing YouTube URL."
+/* --------------------------------------------------
+   YOUTUBE METADATA
+--------------------------------------------------
+
+   This ONLY retrieves public metadata.
+
+   It does not attempt to bypass YouTube security
+   or extract the YouTube stream.
+-------------------------------------------------- */
+
+app.get("/analyze", async (req, res) => {
+    const url = String(req.query.url || "");
+    const id = youtubeId(url);
+
+    if (!id) {
+        return res.status(400).json({
+            error: "Invalid YouTube watch URL."
         });
-
     }
-
-    const url =
-      input.trim();
-
-    if (
-      !isYouTubeURL(url)
-    ) {
-
-      return res
-        .status(400)
-        .json({
-          success: false,
-          error:
-            "Please enter a valid YouTube video URL."
-        });
-
-    }
-
-    const videoId =
-      getYouTubeVideoId(url);
 
     try {
+        const metadataUrl =
+            "https://www.youtube.com/oembed?format=json&url=" +
+            encodeURIComponent(
+                "https://www.youtube.com/watch?v=" + id
+            );
 
-      const endpoint =
-        "https://www.youtube.com/oembed" +
-        "?url=" +
-        encodeURIComponent(url) +
-        "&format=json";
+        const response = await fetch(metadataUrl);
 
-      const response =
-        await fetch(endpoint);
+        if (!response.ok) {
+            return res.status(502).json({
+                error: "YouTube metadata could not be retrieved."
+            });
+        }
 
-      if (!response.ok) {
+        const data = await response.json();
 
-        throw new Error(
-          `YouTube returned HTTP ${response.status}`
-        );
-
-      }
-
-      const data =
-        await response.json();
-
-      return res.json({
-
-        success: true,
-
-        type: "YouTube",
-
-        id: videoId,
-
-        title:
-          data.title ||
-          null,
-
-        uploader:
-          data.author_name ||
-          null,
-
-        channel:
-          data.author_name ||
-          null,
-
-        thumbnail:
-          data.thumbnail_url ||
-          `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
-
-        thumbnailWidth:
-          data.thumbnail_width ||
-          null,
-
-        thumbnailHeight:
-          data.thumbnail_height ||
-          null,
-
-        webpageUrl:
-          url,
-
-        playerUrl:
-          `https://www.youtube.com/watch?v=${videoId}`,
-
-        note:
-          "Metadata only. No server-side YouTube download is performed."
-
-      });
+        res.json({
+            videoId: id,
+            title: data.title || "YouTube Video",
+            author_name: data.author_name || "Unknown",
+            author_url: data.author_url || "",
+            thumbnail_url:
+                "https://i.ytimg.com/vi/" +
+                id +
+                "/hqdefault.jpg"
+        });
 
     } catch (error) {
+        console.error("Analyze error:", error);
 
-      console.error(
-        "YouTube analyze error:",
-        friendlyError(error)
-      );
-
-      return res
-        .status(502)
-        .json({
-
-          success: false,
-
-          error:
-            "YouTube metadata could not be retrieved.",
-
-          details:
-            friendlyError(error)
-
+        res.status(502).json({
+            error: "Metadata request failed."
         });
+    }
+});
 
+/* --------------------------------------------------
+   PROCESS AUTHORIZED VIDEO
+-------------------------------------------------- */
+
+async function processUpload(req, res) {
+    if (!req.file) {
+        return res.status(400).json({
+            error: "Upload a video in the 'video' field."
+        });
     }
 
-  }
-);
+    const jobId = crypto.randomUUID();
 
+    const directory = path.join(
+        tempRoot,
+        jobId
+    );
 
-/* =========================================================
-   VIDEO PROCESSING
-========================================================= */
+    const input = path.join(
+        directory,
+        "source"
+    );
 
-async function processUploadedVideo(
-  req,
-  res,
-  mode
-) {
-
-  if (
-    !req.file
-  ) {
-
-    return res
-      .status(400)
-      .json({
-
-        success: false,
-
-        error:
-          "No video file was uploaded."
-
-      });
-
-  }
-
-
-  if (
-    activeJobs >=
-    MAX_CONCURRENT_JOBS
-  ) {
+    const output = path.join(
+        directory,
+        "spitz-x-video.mp4"
+    );
 
     try {
-      await fsp.rm(
-        req.file.path,
-        {
-          force: true
-        }
-      );
-    } catch {}
-
-    return res
-      .status(429)
-      .json({
-
-        success: false,
-
-        error:
-          "The media processor is busy. Please try again shortly."
-
-      });
-
-  }
-
-
-  activeJobs++;
-
-
-  const job =
-    createJob();
-
-  jobs.set(
-    job.id,
-    job
-  );
-
-
-  try {
-
-    await fsp.mkdir(
-      job.directory,
-      {
-        recursive: true
-      }
-    );
-
-
-    const inputExtension =
-      path.extname(
-        req.file.originalname
-      )
-      .toLowerCase() ||
-      ".video";
-
-
-    const inputPath =
-      path.join(
-        job.directory,
-        `input${inputExtension}`
-      );
-
-
-    const outputPath =
-      path.join(
-        job.directory,
-        "spitz-x-output.mp4"
-      );
-
-
-    await fsp.rename(
-      req.file.path,
-      inputPath
-    );
-
-
-    console.log(
-      `Starting ${mode} job ${job.id}`
-    );
-
-
-    await runFFmpeg(
-      inputPath,
-      outputPath
-    );
-
-
-    const stats =
-      await fsp.stat(
-        outputPath
-      );
-
-
-    if (
-      stats.size <= 0
-    ) {
-
-      throw new Error(
-        "FFmpeg produced an empty file."
-      );
-
-    }
-
-
-    job.file =
-      outputPath;
-
-    job.filename =
-      safeFilename(
-        path.parse(
-          req.file.originalname
-        ).name +
-        ".mp4"
-      );
-
-
-    scheduleCleanup(
-      job.id
-    );
-
-
-    const mediaURL =
-      publicMediaURL(
-        req,
-        job.id
-      );
-
-
-    activeJobs--;
-
-
-    return res.json({
-
-      success: true,
-
-      jobId:
-        job.id,
-
-      mode:
-        mode,
-
-      filename:
-        job.filename,
-
-      size:
-        stats.size,
-
-      playbackUrl:
-        mediaURL,
-
-      downloadUrl:
-        mediaURL +
-        "?download=1",
-
-      expiresIn:
-        FILE_LIFETIME_MS / 1000
-
-    });
-
-
-  } catch (error) {
-
-    activeJobs--;
-
-    await cleanupJob(
-      job.id
-    );
-
-
-    console.error(
-      `${mode} error:`,
-      friendlyError(error)
-    );
-
-
-    return res
-      .status(500)
-      .json({
-
-        success: false,
-
-        error:
-          "Video processing failed.",
-
-        details:
-          friendlyError(error)
-
-      });
-
-  }
-
-}
-
-
-/* =========================================================
-   PROCESS
-========================================================= */
-
-app.post(
-  "/process",
-  upload.single("video"),
-  async (req, res) => {
-
-    return processUploadedVideo(
-      req,
-      res,
-      "process"
-    );
-
-  }
-);
-
-
-/* =========================================================
-   PLAYBACK
-========================================================= */
-
-app.post(
-  "/playback",
-  upload.single("video"),
-  async (req, res) => {
-
-    return processUploadedVideo(
-      req,
-      res,
-      "playback"
-    );
-
-  }
-);
-
-
-/* =========================================================
-   MP4 CONVERSION
-========================================================= */
-
-app.post(
-  "/convert",
-  upload.single("video"),
-  async (req, res) => {
-
-    if (
-      req.body?.format &&
-      req.body.format !== "mp4"
-    ) {
-
-      return res
-        .status(400)
-        .json({
-
-          success: false,
-
-          error:
-            "Only MP4 output is supported."
-
+        await fsp.mkdir(directory, {
+            recursive: true
         });
 
+        await fsp.rename(
+            req.file.path,
+            input
+        );
+
+        await runFfmpeg(
+            input,
+            output
+        );
+
+        const submittedVideoId =
+            String(req.body.videoId || "").trim();
+
+        const submittedVideoUrl =
+            String(req.body.videoUrl || "").trim();
+
+        const videoId =
+            youtubeId(submittedVideoUrl) ||
+            submittedVideoId ||
+            null;
+
+        jobs.set(jobId, {
+            input,
+            output,
+            directory,
+            videoId,
+            created: Date.now()
+        });
+
+        setTimeout(() => {
+            cleanupJob(jobId);
+        }, TTL);
+
+        res.json({
+            ok: true,
+
+            jobId,
+
+            videoId,
+
+            playbackUrl:
+                "/playback/" + jobId,
+
+            mediaUrl:
+                "/media/" + jobId,
+
+            downloadUrl:
+                "/download/" + jobId,
+
+            expiresInMinutes: 15
+        });
+
+    } catch (error) {
+        console.error("Processing error:", error);
+
+        await fsp.rm(
+            directory,
+            {
+                recursive: true,
+                force: true
+            }
+        ).catch(() => {});
+
+        res.status(500).json({
+            error:
+                error.message ||
+                "Video processing failed."
+        });
     }
+}
 
+/* --------------------------------------------------
+   PROCESS / CONVERT
+-------------------------------------------------- */
 
-    return processUploadedVideo(
-      req,
-      res,
-      "mp4"
-    );
-
-  }
+app.post(
+    "/process",
+    upload.single("video"),
+    processUpload
 );
 
+app.post(
+    "/convert",
+    upload.single("video"),
+    processUpload
+);
 
-/* =========================================================
-   MEDIA FILE
-========================================================= */
+/* --------------------------------------------------
+   MEDIA LOOKUP BY YOUTUBE VIDEO ID
+-------------------------------------------------- */
 
 app.get(
-  "/media/:jobId",
-  async (req, res) => {
+    "/media/by-video/:videoId",
+    (req, res) => {
+        const videoId =
+            String(req.params.videoId || "").trim();
 
-    const jobId =
-      req.params.jobId;
+        if (!videoId) {
+            return res.status(400).json({
+                error: "Missing video ID."
+            });
+        }
 
+        const matching = [
+            ...jobs.entries()
+        ]
+            .reverse()
+            .find(
+                ([, job]) =>
+                    job.videoId === videoId &&
+                    fs.existsSync(job.output)
+            );
 
-    if (
-      !/^[a-f0-9-]{36}$/i.test(
-        jobId
-      )
-    ) {
+        if (!matching) {
+            return res.status(404).json({
+                error:
+                    "No authorized MP4 copy is currently registered for this video."
+            });
+        }
 
-      return res
-        .status(400)
-        .json({
+        const [jobId, job] = matching;
 
-          error:
-            "Invalid media ID."
+        res.json({
+            ok: true,
 
+            videoId,
+
+            jobId,
+
+            playbackUrl:
+                "/playback/" + jobId,
+
+            mediaUrl:
+                "/media/" + jobId,
+
+            downloadUrl:
+                "/download/" + jobId,
+
+            expiresInMinutes: Math.max(
+                0,
+                Math.ceil(
+                    (
+                        TTL -
+                        (Date.now() - job.created)
+                    ) /
+                    60000
+                )
+            )
         });
-
     }
+);
 
+/* --------------------------------------------------
+   MEDIA SERVING
+-------------------------------------------------- */
 
+function getJob(req, res) {
     const job =
-      jobs.get(
-        jobId
-      );
-
+        jobs.get(req.params.jobId);
 
     if (
-      !job ||
-      !job.file
+        !job ||
+        !fs.existsSync(job.output)
     ) {
-
-      return res
-        .status(404)
-        .json({
-
-          error:
-            "Media has expired or does not exist."
-
-        });
-
-    }
-
-
-    try {
-
-      await fsp.access(
-        job.file,
-        fs.constants.R_OK
-      );
-
-
-      const download =
-        req.query.download === "1";
-
-
-      res.setHeader(
-        "Cache-Control",
-        "no-store"
-      );
-
-
-      res.setHeader(
-        "Accept-Ranges",
-        "bytes"
-      );
-
-
-      res.setHeader(
-        "Content-Type",
-        "video/mp4"
-      );
-
-
-      if (download) {
-
-        res.setHeader(
-          "Content-Disposition",
-          `attachment; filename="${safeFilename(
-            job.filename ||
-            "spitz-x-video.mp4"
-          )}"`
-        );
-
-      } else {
-
-        res.setHeader(
-          "Content-Disposition",
-          "inline"
-        );
-
-      }
-
-
-      return res.sendFile(
-        job.file
-      );
-
-
-    } catch (error) {
-
-      console.error(
-        "Media serve error:",
-        error.message
-      );
-
-      return res
-        .status(404)
-        .json({
-
-          error:
-            "Media file is no longer available."
-
-        });
-
-    }
-
-  }
-);
-
-
-/* =========================================================
-   MULTER ERROR HANDLER
-========================================================= */
-
-app.use(
-  (
-    error,
-    req,
-    res,
-    next
-  ) => {
-
-    if (
-      error instanceof multer.MulterError
-    ) {
-
-      if (
-        error.code ===
-        "LIMIT_FILE_SIZE"
-      ) {
-
-        return res
-          .status(413)
-          .json({
-
-            success: false,
-
+        res.status(404).json({
             error:
-              "Video is too large. Maximum upload size is 250 MB."
-
-          });
-
-      }
-
-      return res
-        .status(400)
-        .json({
-
-          success: false,
-
-          error:
-            error.message
-
+                "Media expired or was not found."
         });
 
+        return null;
     }
 
+    return job;
+}
+
+/* --------------------------------------------------
+   INLINE PLAYBACK
+-------------------------------------------------- */
+
+app.get(
+    "/playback/:jobId",
+    (req, res) => {
+        const job = getJob(req, res);
+
+        if (!job) return;
+
+        res.setHeader(
+            "Content-Type",
+            "video/mp4"
+        );
+
+        res.setHeader(
+            "Content-Disposition",
+            'inline; filename="spitz-x-video.mp4"'
+        );
+
+        res.sendFile(job.output);
+    }
+);
+
+/* --------------------------------------------------
+   NORMAL MEDIA URL
+-------------------------------------------------- */
+
+app.get(
+    "/media/:jobId",
+    (req, res) => {
+        const job = getJob(req, res);
+
+        if (!job) return;
+
+        res.setHeader(
+            "Content-Type",
+            "video/mp4"
+        );
+
+        res.setHeader(
+            "Content-Disposition",
+            'inline; filename="spitz-x-video.mp4"'
+        );
+
+        res.sendFile(job.output);
+    }
+);
+
+/* --------------------------------------------------
+   DOWNLOAD MP4
+-------------------------------------------------- */
+
+app.get(
+    "/download/:jobId",
+    (req, res) => {
+        const job = getJob(req, res);
+
+        if (!job) return;
+
+        res.download(
+            job.output,
+            "spitz-x-video.mp4"
+        );
+    }
+);
+
+/* --------------------------------------------------
+   ERROR HANDLER
+-------------------------------------------------- */
+
+app.use((error, req, res, next) => {
+    console.error(error);
 
     if (
-      error
+        error.code === "LIMIT_FILE_SIZE"
     ) {
-
-      return res
-        .status(400)
-        .json({
-
-          success: false,
-
-          error:
-            error.message ||
-            "Request failed."
-
+        return res.status(413).json({
+            error:
+                "Video is too large. Maximum size is 250 MB."
         });
-
     }
 
-
-    next();
-
-  }
-);
-
-
-/* =========================================================
-   404
-========================================================= */
-
-app.use(
-  (req, res) => {
-
-    res
-      .status(404)
-      .json({
-
-        success: false,
-
+    res.status(500).json({
         error:
-          "SPITz-X API endpoint not found."
+            error.message ||
+            "Server error."
+    });
+});
 
-      });
+/* --------------------------------------------------
+   PERIODIC CLEANUP
+-------------------------------------------------- */
 
-  }
-);
+setInterval(() => {
+    const now = Date.now();
 
+    for (const [id, job] of jobs.entries()) {
+        if (
+            now - job.created >= TTL
+        ) {
+            cleanupJob(id);
+        }
+    }
+}, 60 * 1000);
 
-/* =========================================================
-   SERVER
-========================================================= */
+/* --------------------------------------------------
+   START SERVER
+-------------------------------------------------- */
 
 app.listen(
-  PORT,
-  "0.0.0.0",
-  () => {
-
-    console.log(
-      `SPITz-X API v${API_VERSION} running on port ${PORT}`
-    );
-
-    console.log(
-      "FFmpeg processor enabled"
-    );
-
-  }
+    PORT,
+    "0.0.0.0",
+    () => {
+        console.log(
+            `SPITz-X API listening on port ${PORT}`
+        );
+    }
 );
