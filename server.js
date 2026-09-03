@@ -6,20 +6,20 @@ const path = require("path");
 const os = require("os");
 const crypto = require("crypto");
 const { execFile } = require("child_process");
+const multer = require("multer");
 
 const app = express();
 
 const PORT = process.env.PORT || 10000;
+const API_VERSION = "2.1.0";
 
-const API_VERSION = "2.0.0";
-
-const MAX_FILE_SIZE = "500M";
+const MAX_UPLOAD_BYTES = 250 * 1024 * 1024;
 const MAX_CONCURRENT_JOBS = 1;
 const FILE_LIFETIME_MS = 15 * 60 * 1000;
 
 const MEDIA_ROOT = path.join(
-    os.tmpdir(),
-    "spitz-x-media"
+  os.tmpdir(),
+  "spitz-x-media"
 );
 
 const jobs = new Map();
@@ -28,23 +28,23 @@ let activeJobs = 0;
 
 
 /* =========================================================
-   BASIC SERVER CONFIG
+   BASIC CONFIG
 ========================================================= */
 
 app.disable("x-powered-by");
 
 app.use(
-    cors({
-        origin: "*",
-        methods: ["GET", "POST", "OPTIONS"],
-        allowedHeaders: ["Content-Type"]
-    })
+  cors({
+    origin: "*",
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type"]
+  })
 );
 
 app.use(
-    express.json({
-        limit: "32kb"
-    })
+  express.json({
+    limit: "32kb"
+  })
 );
 
 
@@ -53,28 +53,65 @@ app.use(
 ========================================================= */
 
 async function initialize() {
+  await fsp.mkdir(MEDIA_ROOT, {
+    recursive: true
+  });
 
-    await fsp.mkdir(
-        MEDIA_ROOT,
-        {
-            recursive: true
-        }
-    );
-
-    console.log(
-        "SPITz-X media directory:",
-        MEDIA_ROOT
-    );
-
+  console.log(
+    "SPITz-X media directory:",
+    MEDIA_ROOT
+  );
 }
 
 initialize().catch(error => {
+  console.error(
+    "Startup error:",
+    error
+  );
+});
 
-    console.error(
-        "Startup error:",
-        error
+
+/* =========================================================
+   MULTER UPLOAD CONFIG
+========================================================= */
+
+const upload = multer({
+  dest: path.join(
+    MEDIA_ROOT,
+    "uploads"
+  ),
+
+  limits: {
+    fileSize: MAX_UPLOAD_BYTES,
+    files: 1
+  },
+
+  fileFilter: (req, file, callback) => {
+
+    const allowedMimeTypes = [
+      "video/mp4",
+      "video/webm",
+      "video/quicktime",
+      "video/x-matroska",
+      "video/x-msvideo",
+      "video/mpeg"
+    ];
+
+    if (
+      allowedMimeTypes.includes(
+        file.mimetype
+      )
+    ) {
+      callback(null, true);
+      return;
+    }
+
+    callback(
+      new Error(
+        "Unsupported video format."
+      )
     );
-
+  }
 });
 
 
@@ -84,27 +121,20 @@ initialize().catch(error => {
 
 app.get("/", (req, res) => {
 
-    res.json({
+  res.json({
+    name: "SPITz-X API",
+    status: "online",
+    version: API_VERSION,
 
-        name: "SPITz-X API",
-
-        status: "online",
-
-        version: API_VERSION,
-
-        services: {
-
-            analyze: "/analyze",
-
-            playback: "/playback",
-
-            convert: "/convert",
-
-            health: "/health"
-
-        }
-
-    });
+    services: {
+      analyze: "/analyze",
+      process: "/process",
+      playback: "/playback",
+      convert: "/convert",
+      media: "/media/:jobId",
+      health: "/health"
+    }
+  });
 
 });
 
@@ -115,898 +145,721 @@ app.get("/", (req, res) => {
 
 app.get("/health", (req, res) => {
 
-    res.json({
+  res.json({
+    status: "ok",
+    service: "SPITz-X API",
+    version: API_VERSION,
 
-        status: "ok",
+    processor: "ffmpeg",
 
-        service: "SPITz-X API",
+    activeJobs: activeJobs,
 
-        version: API_VERSION,
+    maxConcurrentJobs:
+      MAX_CONCURRENT_JOBS,
 
-        processor:
-            ytDlpPath(),
-
-        activeJobs:
-            activeJobs,
-
-        maxConcurrentJobs:
-            MAX_CONCURRENT_JOBS
-
-    });
+    maxUploadMB:
+      MAX_UPLOAD_BYTES /
+      1024 /
+      1024
+  });
 
 });
 
 
 /* =========================================================
-   HELPERS
+   YOUTUBE HELPERS
 ========================================================= */
 
-function ytDlpPath() {
+function getYouTubeVideoId(value) {
 
-    return path.join(
-        process.cwd(),
-        "yt-dlp"
-    );
+  try {
+
+    const url =
+      new URL(value);
+
+    const hostname =
+      url.hostname
+        .toLowerCase()
+        .replace(/^www\./, "");
+
+    if (
+      hostname === "youtu.be"
+    ) {
+
+      const id =
+        url.pathname
+          .split("/")
+          .filter(Boolean)[0];
+
+      return id || null;
+    }
+
+    if (
+      hostname !== "youtube.com" &&
+      hostname !== "m.youtube.com"
+    ) {
+      return null;
+    }
+
+    if (
+      url.pathname === "/watch"
+    ) {
+
+      return (
+        url.searchParams.get("v") ||
+        null
+      );
+    }
+
+    if (
+      url.pathname.startsWith("/shorts/")
+    ) {
+
+      return (
+        url.pathname
+          .split("/")
+          .filter(Boolean)[1] ||
+        null
+      );
+    }
+
+    if (
+      url.pathname.startsWith("/embed/")
+    ) {
+
+      return (
+        url.pathname
+          .split("/")
+          .filter(Boolean)[1] ||
+        null
+      );
+    }
+
+    return null;
+
+  } catch {
+
+    return null;
+
+  }
 
 }
 
 
 function isYouTubeURL(value) {
 
-    try {
-
-        const url =
-            new URL(value);
-
-        const hostname =
-            url.hostname
-                .toLowerCase()
-                .replace(/^www\./, "");
-
-        const allowedHosts = [
-
-            "youtube.com",
-
-            "m.youtube.com",
-
-            "youtu.be"
-
-        ];
-
-        if (
-            !allowedHosts.includes(
-                hostname
-            )
-        ) {
-
-            return false;
-
-        }
-
-        if (
-            hostname === "youtu.be"
-        ) {
-
-            return (
-                url.pathname
-                    .split("/")
-                    .filter(Boolean)
-                    .length === 1
-            );
-
-        }
-
-        if (
-            url.pathname === "/watch"
-        ) {
-
-            return Boolean(
-                url.searchParams.get("v")
-            );
-
-        }
-
-        if (
-            url.pathname.startsWith(
-                "/shorts/"
-            )
-        ) {
-
-            return (
-                url.pathname
-                    .split("/")
-                    .filter(Boolean)
-                    .length === 2
-            );
-
-        }
-
-        if (
-            url.pathname.startsWith(
-                "/embed/"
-            )
-        ) {
-
-            return (
-                url.pathname
-                    .split("/")
-                    .filter(Boolean)
-                    .length === 2
-            );
-
-        }
-
-        return false;
-
-    } catch {
-
-        return false;
-
-    }
+  return Boolean(
+    getYouTubeVideoId(value)
+  );
 
 }
 
 
-function validateURL(value) {
+/* =========================================================
+   GENERAL HELPERS
+========================================================= */
+
+function createJob() {
+
+  const id =
+    crypto.randomUUID();
+
+  const directory =
+    path.join(
+      MEDIA_ROOT,
+      id
+    );
+
+  return {
+    id,
+    directory,
+    createdAt: Date.now(),
+    file: null,
+    filename: null
+  };
+
+}
+
+
+async function cleanupJob(jobId) {
+
+  const job =
+    jobs.get(jobId);
+
+  if (!job) {
+    return;
+  }
+
+  try {
+
+    await fsp.rm(
+      job.directory,
+      {
+        recursive: true,
+        force: true
+      }
+    );
+
+  } catch (error) {
+
+    console.error(
+      "Cleanup error:",
+      error.message
+    );
+
+  }
+
+  jobs.delete(jobId);
+
+}
+
+
+function scheduleCleanup(jobId) {
+
+  setTimeout(
+    () => {
+      cleanupJob(jobId);
+    },
+    FILE_LIFETIME_MS
+  );
+
+}
+
+
+function safeFilename(value) {
+
+  return String(value)
+
+    .replace(
+      /[<>:"/\\|?*\x00-\x1F]/g,
+      "_"
+    )
+
+    .replace(
+      /\s+/g,
+      " "
+    )
+
+    .trim()
+
+    .slice(
+      0,
+      180
+    ) ||
+
+    "spitz-x-video.mp4";
+
+}
+
+
+function publicMediaURL(req, jobId) {
+
+  return (
+    `${req.protocol}://${req.get("host")}` +
+    `/media/${encodeURIComponent(jobId)}`
+  );
+
+}
+
+
+function runFFmpeg(
+  input,
+  output
+) {
+
+  return new Promise(
+    (resolve, reject) => {
+
+      const args = [
+
+        "-y",
+
+        "-i",
+        input,
+
+        "-c:v",
+        "libx264",
+
+        "-preset",
+        "veryfast",
+
+        "-crf",
+        "23",
+
+        "-c:a",
+        "aac",
+
+        "-b:a",
+        "128k",
+
+        "-movflags",
+        "+faststart",
+
+        output
+
+      ];
+
+      execFile(
+        "ffmpeg",
+        args,
+
+        {
+          timeout:
+            10 * 60 * 1000,
+
+          maxBuffer:
+            8 * 1024 * 1024
+        },
+
+        (
+          error,
+          stdout,
+          stderr
+        ) => {
+
+          if (error) {
+
+            error.stdout =
+              stdout;
+
+            error.stderr =
+              stderr;
+
+            reject(error);
+
+            return;
+
+          }
+
+          resolve({
+            stdout,
+            stderr
+          });
+
+        }
+      );
+
+    }
+  );
+
+}
+
+
+function friendlyError(error) {
+
+  const output =
+    (
+      error?.stderr ||
+      error?.stdout ||
+      error?.message ||
+      ""
+    )
+    .toString()
+    .trim();
+
+  if (
+    output.length > 1200
+  ) {
+
+    return output.slice(
+      -1200
+    );
+
+  }
+
+  return (
+    output ||
+    "Media processing failed."
+  );
+
+}
+
+
+/* =========================================================
+   YOUTUBE ANALYZE
+========================================================= */
+
+/*
+   This does NOT download the YouTube video.
+
+   It asks YouTube's public oEmbed endpoint
+   for basic metadata.
+*/
+
+app.post(
+  "/analyze",
+  async (req, res) => {
+
+    const input =
+      req.body?.url;
 
     if (
-        typeof value !== "string" ||
-        !value.trim()
+      typeof input !== "string" ||
+      !input.trim()
     ) {
 
-        return {
-            valid: false,
-            error: "Missing URL."
-        };
+      return res
+        .status(400)
+        .json({
+          success: false,
+          error: "Missing YouTube URL."
+        });
 
     }
 
     const url =
-        value.trim();
+      input.trim();
 
     if (
-        url.length > 2048
+      !isYouTubeURL(url)
     ) {
 
-        return {
-            valid: false,
-            error: "URL is too long."
-        };
+      return res
+        .status(400)
+        .json({
+          success: false,
+          error:
+            "Please enter a valid YouTube video URL."
+        });
 
     }
 
-    if (
-        !isYouTubeURL(url)
-    ) {
-
-        return {
-
-            valid: false,
-
-            error:
-                "Only supported YouTube video URLs are currently accepted."
-
-        };
-
-    }
-
-    return {
-
-        valid: true,
-
-        url: url
-
-    };
-
-}
-
-
-function runYTDLP(
-    args,
-    timeout
-) {
-
-    return new Promise(
-        (resolve, reject) => {
-
-            execFile(
-
-                ytDlpPath(),
-
-                args,
-
-                {
-
-                    timeout:
-                        timeout,
-
-                    maxBuffer:
-                        8 * 1024 * 1024,
-
-                    windowsHide:
-                        true
-
-                },
-
-                (
-                    error,
-                    stdout,
-                    stderr
-                ) => {
-
-                    if (error) {
-
-                        error.stdout =
-                            stdout;
-
-                        error.stderr =
-                            stderr;
-
-                        reject(error);
-
-                        return;
-
-                    }
-
-                    resolve({
-
-                        stdout:
-                            stdout,
-
-                        stderr:
-                            stderr
-
-                    });
-
-                }
-
-            );
-
-        }
-    );
-
-}
-
-
-function createJob() {
-
-    const id =
-        crypto.randomUUID();
-
-    const directory =
-        path.join(
-            MEDIA_ROOT,
-            id
-        );
-
-    return {
-
-        id,
-
-        directory,
-
-        createdAt:
-            Date.now(),
-
-        file: null,
-
-        title: null
-
-    };
-
-}
-
-
-async function cleanupJob(
-    jobId
-) {
-
-    const job =
-        jobs.get(jobId);
-
-    if (!job) {
-        return;
-    }
+    const videoId =
+      getYouTubeVideoId(url);
 
     try {
 
-        await fsp.rm(
-            job.directory,
-            {
-                recursive: true,
-                force: true
-            }
+      const endpoint =
+        "https://www.youtube.com/oembed" +
+        "?url=" +
+        encodeURIComponent(url) +
+        "&format=json";
+
+      const response =
+        await fetch(endpoint);
+
+      if (!response.ok) {
+
+        throw new Error(
+          `YouTube returned HTTP ${response.status}`
         );
+
+      }
+
+      const data =
+        await response.json();
+
+      return res.json({
+
+        success: true,
+
+        type: "YouTube",
+
+        id: videoId,
+
+        title:
+          data.title ||
+          null,
+
+        uploader:
+          data.author_name ||
+          null,
+
+        channel:
+          data.author_name ||
+          null,
+
+        thumbnail:
+          data.thumbnail_url ||
+          `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
+
+        thumbnailWidth:
+          data.thumbnail_width ||
+          null,
+
+        thumbnailHeight:
+          data.thumbnail_height ||
+          null,
+
+        webpageUrl:
+          url,
+
+        playerUrl:
+          `https://www.youtube.com/watch?v=${videoId}`,
+
+        note:
+          "Metadata only. No server-side YouTube download is performed."
+
+      });
 
     } catch (error) {
 
-        console.error(
-            "Cleanup error:",
-            error.message
-        );
+      console.error(
+        "YouTube analyze error:",
+        friendlyError(error)
+      );
 
-    }
+      return res
+        .status(502)
+        .json({
 
-    jobs.delete(jobId);
+          success: false,
 
-}
+          error:
+            "YouTube metadata could not be retrieved.",
 
-
-function scheduleCleanup(
-    jobId
-) {
-
-    setTimeout(
-        () => {
-
-            cleanupJob(
-                jobId
-            );
-
-        },
-        FILE_LIFETIME_MS
-    );
-
-}
-
-
-function formatDuration(
-    seconds
-) {
-
-    if (
-        !Number.isFinite(
-            seconds
-        )
-    ) {
-
-        return null;
-
-    }
-
-    seconds =
-        Math.max(
-            0,
-            Math.floor(seconds)
-        );
-
-    const hours =
-        Math.floor(
-            seconds / 3600
-        );
-
-    const minutes =
-        Math.floor(
-            (seconds % 3600) / 60
-        );
-
-    const secs =
-        seconds % 60;
-
-    if (hours > 0) {
-
-        return (
-            String(hours).padStart(2, "0") +
-            ":" +
-            String(minutes).padStart(2, "0") +
-            ":" +
-            String(secs).padStart(2, "0")
-        );
-
-    }
-
-    return (
-        String(minutes).padStart(2, "0") +
-        ":" +
-        String(secs).padStart(2, "0")
-    );
-
-}
-
-
-function getOutputFile(
-    directory
-) {
-
-    const possibleExtensions = [
-
-        ".mp4",
-        ".webm",
-        ".mkv",
-        ".mov",
-        ".avi",
-        ".flv"
-
-    ];
-
-    return fsp
-        .readdir(
-            directory
-        )
-        .then(files => {
-
-            const match =
-                files.find(
-                    file => {
-
-                        const extension =
-                            path.extname(
-                                file
-                            )
-                            .toLowerCase();
-
-                        return possibleExtensions.includes(
-                            extension
-                        );
-
-                    }
-                );
-
-            if (!match) {
-
-                throw new Error(
-                    "The media processor did not produce a video file."
-                );
-
-            }
-
-            return path.join(
-                directory,
-                match
-            );
+          details:
+            friendlyError(error)
 
         });
 
-}
-
-
-function publicMediaURL(
-    req,
-    jobId
-) {
-
-    return (
-        `${req.protocol}://${req.get("host")}` +
-        `/media/${encodeURIComponent(jobId)}`
-    );
-
-}
-
-
-function friendlyError(
-    error
-) {
-
-    const output =
-        (
-            error.stderr ||
-            error.stdout ||
-            error.message ||
-            ""
-        )
-        .toString()
-        .trim();
-
-    if (
-        output.length > 1000
-    ) {
-
-        return output.slice(
-            -1000
-        );
-
     }
 
-    return output ||
-        "Media processing failed.";
-
-}
-
-
-/* =========================================================
-   ANALYZE
-========================================================= */
-
-app.post(
-    "/analyze",
-    async (req, res) => {
-
-        const validation =
-            validateURL(
-                req.body?.url
-            );
-
-        if (!validation.valid) {
-
-            return res
-                .status(400)
-                .json({
-
-                    success: false,
-
-                    error:
-                        validation.error
-
-                });
-
-        }
-
-        try {
-
-            const result =
-                await runYTDLP(
-
-                    [
-
-                        "--dump-single-json",
-
-                        "--skip-download",
-
-                        "--no-playlist",
-
-                        "--no-warnings",
-
-                        "--js-runtimes",
-                        "node",
-
-                        "--remote-components",
-                        "ejs:github",
-
-                        validation.url
-
-                    ],
-
-                    60000
-
-                );
-
-
-            const data =
-                JSON.parse(
-                    result.stdout
-                );
-
-
-            return res.json({
-
-                success: true,
-
-                type:
-                    data.extractor_key ||
-                    "YouTube",
-
-                id:
-                    data.id ||
-                    null,
-
-                title:
-                    data.title ||
-                    null,
-
-                uploader:
-                    data.uploader ||
-                    data.channel ||
-                    null,
-
-                channel:
-                    data.channel ||
-                    null,
-
-                duration:
-                    data.duration ||
-                    null,
-
-                durationFormatted:
-                    formatDuration(
-                        data.duration
-                    ),
-
-                thumbnail:
-                    data.thumbnail ||
-                    null,
-
-                width:
-                    data.width ||
-                    null,
-
-                height:
-                    data.height ||
-                    null,
-
-                resolution:
-                    data.resolution ||
-                    (
-                        data.width &&
-                        data.height
-                            ? `${data.width}x${data.height}`
-                            : null
-                    ),
-
-                webpageUrl:
-                    data.webpage_url ||
-                    validation.url,
-
-                live:
-                    Boolean(
-                        data.is_live
-                    )
-
-            });
-
-        } catch (error) {
-
-            console.error(
-                "Analyze error:",
-                friendlyError(
-                    error
-                )
-            );
-
-            return res
-                .status(500)
-                .json({
-
-                    success: false,
-
-                    error:
-                        "Unable to analyze this video.",
-
-                    details:
-                        friendlyError(
-                            error
-                        )
-
-                });
-
-        }
-
-    }
+  }
 );
 
 
 /* =========================================================
-   PROCESS MEDIA
+   VIDEO PROCESSING
 ========================================================= */
 
-async function processMedia(
-    req,
-    res,
-    mode
+async function processUploadedVideo(
+  req,
+  res,
+  mode
 ) {
 
-    const validation =
-        validateURL(
-            req.body?.url
-        );
+  if (
+    !req.file
+  ) {
 
-    if (!validation.valid) {
+    return res
+      .status(400)
+      .json({
 
-        return res
-            .status(400)
-            .json({
+        success: false,
 
-                success: false,
+        error:
+          "No video file was uploaded."
 
-                error:
-                    validation.error
+      });
 
-            });
-
-    }
+  }
 
 
-    if (
-        activeJobs >=
-        MAX_CONCURRENT_JOBS
-    ) {
+  if (
+    activeJobs >=
+    MAX_CONCURRENT_JOBS
+  ) {
 
-        return res
-            .status(429)
-            .json({
+    try {
+      await fsp.rm(
+        req.file.path,
+        {
+          force: true
+        }
+      );
+    } catch {}
 
-                success: false,
+    return res
+      .status(429)
+      .json({
 
-                error:
-                    "The media processor is busy. Please try again in a moment."
+        success: false,
 
-            });
+        error:
+          "The media processor is busy. Please try again shortly."
 
-    }
+      });
 
-
-    activeJobs++;
-
-
-    const job =
-        createJob();
+  }
 
 
-    jobs.set(
-        job.id,
-        job
+  activeJobs++;
+
+
+  const job =
+    createJob();
+
+  jobs.set(
+    job.id,
+    job
+  );
+
+
+  try {
+
+    await fsp.mkdir(
+      job.directory,
+      {
+        recursive: true
+      }
     );
 
 
-    try {
-
-        await fsp.mkdir(
-            job.directory,
-            {
-                recursive: true
-            }
-        );
+    const inputExtension =
+      path.extname(
+        req.file.originalname
+      )
+      .toLowerCase() ||
+      ".video";
 
 
-        /*
-            We keep processing capped at 720p to make
-            the small/free Render instance more practical.
-        */
-
-        const outputTemplate =
-            path.join(
-                job.directory,
-                "video.%(ext)s"
-            );
+    const inputPath =
+      path.join(
+        job.directory,
+        `input${inputExtension}`
+      );
 
 
-        const args = [
-
-            "--no-playlist",
-
-            "--no-warnings",
-
-            "--restrict-filenames",
-
-            "--max-filesize",
-            MAX_FILE_SIZE,
-
-            "--js-runtimes",
-            "node",
-
-            "--remote-components",
-            "ejs:github",
-
-            "-f",
-
-            "bv*[height<=720][ext=mp4]+ba[ext=m4a]/b[height<=720][ext=mp4]/b[height<=720]",
-
-            "--recode-video",
-            "mp4",
-
-            "-o",
-            outputTemplate,
-
-            validation.url
-
-        ];
+    const outputPath =
+      path.join(
+        job.directory,
+        "spitz-x-output.mp4"
+      );
 
 
-        console.log(
-            `Starting ${mode} job ${job.id}`
-        );
+    await fsp.rename(
+      req.file.path,
+      inputPath
+    );
 
 
-        await runYTDLP(
-            args,
-            8 * 60 * 1000
-        );
+    console.log(
+      `Starting ${mode} job ${job.id}`
+    );
 
 
-        const file =
-            await getOutputFile(
-                job.directory
-            );
+    await runFFmpeg(
+      inputPath,
+      outputPath
+    );
 
 
-        const stats =
-            await fsp.stat(
-                file
-            );
+    const stats =
+      await fsp.stat(
+        outputPath
+      );
 
 
-        if (
-            stats.size <= 0
-        ) {
+    if (
+      stats.size <= 0
+    ) {
 
-            throw new Error(
-                "The generated video file is empty."
-            );
-
-        }
-
-
-        job.file =
-            file;
-
-
-        job.title =
-            path.basename(
-                file
-            );
-
-
-        scheduleCleanup(
-            job.id
-        );
-
-
-        const mediaURL =
-            publicMediaURL(
-                req,
-                job.id
-            );
-
-
-        activeJobs--;
-
-
-        return res.json({
-
-            success: true,
-
-            jobId:
-                job.id,
-
-            mode:
-                mode,
-
-            filename:
-                path.basename(
-                    file
-                ),
-
-            size:
-                stats.size,
-
-            playbackUrl:
-                mediaURL,
-
-            downloadUrl:
-                mediaURL +
-                "?download=1",
-
-            expiresIn:
-                FILE_LIFETIME_MS / 1000
-
-        });
-
-
-    } catch (error) {
-
-        activeJobs--;
-
-        await cleanupJob(
-            job.id
-        );
-
-
-        console.error(
-            `${mode} error:`,
-            friendlyError(
-                error
-            )
-        );
-
-
-        return res
-            .status(500)
-            .json({
-
-                success: false,
-
-                error:
-                    `Unable to process media for ${mode}.`,
-
-                details:
-                    friendlyError(
-                        error
-                    )
-
-            });
+      throw new Error(
+        "FFmpeg produced an empty file."
+      );
 
     }
 
+
+    job.file =
+      outputPath;
+
+    job.filename =
+      safeFilename(
+        path.parse(
+          req.file.originalname
+        ).name +
+        ".mp4"
+      );
+
+
+    scheduleCleanup(
+      job.id
+    );
+
+
+    const mediaURL =
+      publicMediaURL(
+        req,
+        job.id
+      );
+
+
+    activeJobs--;
+
+
+    return res.json({
+
+      success: true,
+
+      jobId:
+        job.id,
+
+      mode:
+        mode,
+
+      filename:
+        job.filename,
+
+      size:
+        stats.size,
+
+      playbackUrl:
+        mediaURL,
+
+      downloadUrl:
+        mediaURL +
+        "?download=1",
+
+      expiresIn:
+        FILE_LIFETIME_MS / 1000
+
+    });
+
+
+  } catch (error) {
+
+    activeJobs--;
+
+    await cleanupJob(
+      job.id
+    );
+
+
+    console.error(
+      `${mode} error:`,
+      friendlyError(error)
+    );
+
+
+    return res
+      .status(500)
+      .json({
+
+        success: false,
+
+        error:
+          "Video processing failed.",
+
+        details:
+          friendlyError(error)
+
+      });
+
+  }
+
 }
+
+
+/* =========================================================
+   PROCESS
+========================================================= */
+
+app.post(
+  "/process",
+  upload.single("video"),
+  async (req, res) => {
+
+    return processUploadedVideo(
+      req,
+      res,
+      "process"
+    );
+
+  }
+);
 
 
 /* =========================================================
@@ -1014,16 +867,17 @@ async function processMedia(
 ========================================================= */
 
 app.post(
-    "/playback",
-    async (req, res) => {
+  "/playback",
+  upload.single("video"),
+  async (req, res) => {
 
-        return processMedia(
-            req,
-            res,
-            "playback"
-        );
+    return processUploadedVideo(
+      req,
+      res,
+      "playback"
+    );
 
-    }
+  }
 );
 
 
@@ -1032,35 +886,36 @@ app.post(
 ========================================================= */
 
 app.post(
-    "/convert",
-    async (req, res) => {
+  "/convert",
+  upload.single("video"),
+  async (req, res) => {
 
-        if (
-            req.body?.format &&
-            req.body.format !== "mp4"
-        ) {
+    if (
+      req.body?.format &&
+      req.body.format !== "mp4"
+    ) {
 
-            return res
-                .status(400)
-                .json({
+      return res
+        .status(400)
+        .json({
 
-                    success: false,
+          success: false,
 
-                    error:
-                        "Only MP4 output is supported."
+          error:
+            "Only MP4 output is supported."
 
-                });
-
-        }
-
-
-        return processMedia(
-            req,
-            res,
-            "mp4"
-        );
+        });
 
     }
+
+
+    return processUploadedVideo(
+      req,
+      res,
+      "mp4"
+    );
+
+  }
 );
 
 
@@ -1069,159 +924,202 @@ app.post(
 ========================================================= */
 
 app.get(
-    "/media/:jobId",
-    async (req, res) => {
+  "/media/:jobId",
+  async (req, res) => {
 
-        const jobId =
-            req.params.jobId;
-
-
-        if (
-            !/^[a-f0-9-]{36}$/i.test(
-                jobId
-            )
-        ) {
-
-            return res
-                .status(400)
-                .json({
-
-                    error:
-                        "Invalid media ID."
-
-                });
-
-        }
+    const jobId =
+      req.params.jobId;
 
 
-        const job =
-            jobs.get(
-                jobId
-            );
+    if (
+      !/^[a-f0-9-]{36}$/i.test(
+        jobId
+      )
+    ) {
 
+      return res
+        .status(400)
+        .json({
 
-        if (
-            !job ||
-            !job.file
-        ) {
+          error:
+            "Invalid media ID."
 
-            return res
-                .status(404)
-                .json({
-
-                    error:
-                        "Media has expired or does not exist."
-
-                });
-
-        }
-
-
-        try {
-
-            await fsp.access(
-                job.file,
-                fs.constants.R_OK
-            );
-
-
-            const download =
-                req.query.download === "1";
-
-
-            res.setHeader(
-                "Cache-Control",
-                "no-store"
-            );
-
-
-            res.setHeader(
-                "Accept-Ranges",
-                "bytes"
-            );
-
-
-            res.setHeader(
-                "Content-Type",
-                "video/mp4"
-            );
-
-
-            if (download) {
-
-                res.setHeader(
-                    "Content-Disposition",
-                    `attachment; filename="${safeFilename(
-                        job.title ||
-                        "spitz-x-video.mp4"
-                    )}"`
-                );
-
-            } else {
-
-                res.setHeader(
-                    "Content-Disposition",
-                    "inline"
-                );
-
-            }
-
-
-            res.sendFile(
-                job.file
-            );
-
-
-        } catch (error) {
-
-            console.error(
-                "Media serve error:",
-                error.message
-            );
-
-            return res
-                .status(404)
-                .json({
-
-                    error:
-                        "Media file is no longer available."
-
-                });
-
-        }
+        });
 
     }
+
+
+    const job =
+      jobs.get(
+        jobId
+      );
+
+
+    if (
+      !job ||
+      !job.file
+    ) {
+
+      return res
+        .status(404)
+        .json({
+
+          error:
+            "Media has expired or does not exist."
+
+        });
+
+    }
+
+
+    try {
+
+      await fsp.access(
+        job.file,
+        fs.constants.R_OK
+      );
+
+
+      const download =
+        req.query.download === "1";
+
+
+      res.setHeader(
+        "Cache-Control",
+        "no-store"
+      );
+
+
+      res.setHeader(
+        "Accept-Ranges",
+        "bytes"
+      );
+
+
+      res.setHeader(
+        "Content-Type",
+        "video/mp4"
+      );
+
+
+      if (download) {
+
+        res.setHeader(
+          "Content-Disposition",
+          `attachment; filename="${safeFilename(
+            job.filename ||
+            "spitz-x-video.mp4"
+          )}"`
+        );
+
+      } else {
+
+        res.setHeader(
+          "Content-Disposition",
+          "inline"
+        );
+
+      }
+
+
+      return res.sendFile(
+        job.file
+      );
+
+
+    } catch (error) {
+
+      console.error(
+        "Media serve error:",
+        error.message
+      );
+
+      return res
+        .status(404)
+        .json({
+
+          error:
+            "Media file is no longer available."
+
+        });
+
+    }
+
+  }
 );
 
 
 /* =========================================================
-   SAFE FILENAME
+   MULTER ERROR HANDLER
 ========================================================= */
 
-function safeFilename(
-    value
-) {
+app.use(
+  (
+    error,
+    req,
+    res,
+    next
+  ) => {
 
-    return String(value)
+    if (
+      error instanceof multer.MulterError
+    ) {
 
-        .replace(
-            /[<>:"/\\|?*\x00-\x1F]/g,
-            "_"
-        )
+      if (
+        error.code ===
+        "LIMIT_FILE_SIZE"
+      ) {
 
-        .replace(
-            /\s+/g,
-            " "
-        )
+        return res
+          .status(413)
+          .json({
 
-        .trim()
+            success: false,
 
-        .slice(
-            0,
-            180
-        ) || "spitz-x-video.mp4";
+            error:
+              "Video is too large. Maximum upload size is 250 MB."
 
-}
+          });
+
+      }
+
+      return res
+        .status(400)
+        .json({
+
+          success: false,
+
+          error:
+            error.message
+
+        });
+
+    }
+
+
+    if (
+      error
+    ) {
+
+      return res
+        .status(400)
+        .json({
+
+          success: false,
+
+          error:
+            error.message ||
+            "Request failed."
+
+        });
+
+    }
+
+
+    next();
+
+  }
+);
 
 
 /* =========================================================
@@ -1229,52 +1127,20 @@ function safeFilename(
 ========================================================= */
 
 app.use(
-    (req, res) => {
+  (req, res) => {
 
-        res
-            .status(404)
-            .json({
+    res
+      .status(404)
+      .json({
 
-                success: false,
+        success: false,
 
-                error:
-                    "SPITz-X API endpoint not found."
+        error:
+          "SPITz-X API endpoint not found."
 
-            });
+      });
 
-    }
-);
-
-
-/* =========================================================
-   ERROR HANDLER
-========================================================= */
-
-app.use(
-    (
-        error,
-        req,
-        res,
-        next
-    ) => {
-
-        console.error(
-            "Unhandled API error:",
-            error
-        );
-
-        res
-            .status(500)
-            .json({
-
-                success: false,
-
-                error:
-                    "Internal SPITz-X API error."
-
-            });
-
-    }
+  }
 );
 
 
@@ -1283,17 +1149,17 @@ app.use(
 ========================================================= */
 
 app.listen(
-    PORT,
-    "0.0.0.0",
-    () => {
+  PORT,
+  "0.0.0.0",
+  () => {
 
-        console.log(
-            `SPITz-X API v${API_VERSION} running on port ${PORT}`
-        );
+    console.log(
+      `SPITz-X API v${API_VERSION} running on port ${PORT}`
+    );
 
-        console.log(
-            `yt-dlp expected at: ${ytDlpPath()}`
-        );
+    console.log(
+      "FFmpeg processor enabled"
+    );
 
-    }
+  }
 );
