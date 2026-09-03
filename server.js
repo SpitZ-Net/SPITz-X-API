@@ -12,27 +12,15 @@ const PORT = Number(process.env.PORT || 10000);
 const MAX_UPLOAD = 250 * 1024 * 1024;
 
 // ============================================================
-// YOUTUBE CONVERTER CONFIG
-// ============================================================
-//
-// IMPORTANT:
-// Keep these values in Render Environment Variables.
-// Do NOT put the converter token in your GitHub Pages frontend.
-//
+// CONFIG
 // ============================================================
 
+// Your self-hosted converter API.
+// Example:
+// YOUTUBE_CONVERTER_BASE=http://your-converter-server:3000
 const YOUTUBE_CONVERTER_BASE = String(
-  process.env.YOUTUBE_CONVERTER_BASE ||
-  'https://youtube.michaelbelgium.me'
+  process.env.YOUTUBE_CONVERTER_BASE || ''
 ).replace(/\/$/, '');
-
-const YOUTUBE_CONVERTER_TOKEN = String(
-  process.env.YOUTUBE_CONVERTER_TOKEN || ''
-);
-
-const YOUTUBE_CONVERTER_TOKEN_PARAM = String(
-  process.env.YOUTUBE_CONVERTER_TOKEN_PARAM || 'token'
-);
 
 // ============================================================
 // STORAGE
@@ -45,21 +33,17 @@ const LIBRARY_FILE =
   path.join(MEDIA_ROOT, 'library.json');
 
 fs.mkdirSync(MEDIA_ROOT, { recursive: true });
-
-fs.mkdirSync(
-  path.join(MEDIA_ROOT, '_uploads'),
-  { recursive: true }
-);
+fs.mkdirSync(path.join(MEDIA_ROOT, '_uploads'), {
+  recursive: true
+});
 
 const appData = {
   library: new Map()
 };
 
-// Load existing library
+// Load library
 try {
-
   if (fs.existsSync(LIBRARY_FILE)) {
-
     const saved = JSON.parse(
       fs.readFileSync(LIBRARY_FILE, 'utf8')
     );
@@ -67,28 +51,20 @@ try {
     for (const [id, item] of Object.entries(saved)) {
       appData.library.set(id, item);
     }
-
   }
-
 } catch (err) {
-
   console.warn(
     'Could not load library.json:',
     err.message
   );
-
 }
 
 // ============================================================
-// UPLOAD CONFIG
+// UPLOAD
 // ============================================================
 
 const upload = multer({
-
-  dest: path.join(
-    MEDIA_ROOT,
-    '_uploads'
-  ),
+  dest: path.join(MEDIA_ROOT, '_uploads'),
 
   limits: {
     fileSize: MAX_UPLOAD,
@@ -96,14 +72,11 @@ const upload = multer({
   },
 
   fileFilter: (req, file, cb) => {
-
     cb(
       null,
       /^video\//i.test(file.mimetype)
     );
-
   }
-
 });
 
 // ============================================================
@@ -127,28 +100,22 @@ app.use(
 // ============================================================
 
 function saveLibrary() {
-
   const obj =
-    Object.fromEntries(
-      appData.library
-    );
+    Object.fromEntries(appData.library);
 
   return fsp.writeFile(
     LIBRARY_FILE,
     JSON.stringify(obj, null, 2),
     'utf8'
   );
-
 }
 
 // ============================================================
-// YOUTUBE VIDEO ID
+// YOUTUBE ID
 // ============================================================
 
 function youtubeId(raw) {
-
   try {
-
     const u = new URL(raw);
 
     const h =
@@ -156,77 +123,61 @@ function youtubeId(raw) {
         .replace(/^www\./, '')
         .toLowerCase();
 
-    // youtube.com/watch?v=XXXX
     if (
       (h === 'youtube.com' ||
        h === 'm.youtube.com') &&
       u.pathname === '/watch'
     ) {
-
       return u.searchParams.get('v');
-
     }
 
-    // youtu.be/XXXX
     if (h === 'youtu.be') {
-
       return (
         u.pathname.split('/')[1] ||
         null
       );
-
     }
 
-    // youtube.com/shorts/XXXX
     if (
       h === 'youtube.com' &&
       u.pathname.startsWith('/shorts/')
     ) {
-
       return (
         u.pathname.split('/')[2] ||
         null
       );
-
     }
 
-    // youtube.com/embed/XXXX
     if (
       h === 'youtube.com' &&
       u.pathname.startsWith('/embed/')
     ) {
-
       return (
         u.pathname.split('/')[2] ||
         null
       );
-
     }
 
   } catch (_) {}
 
   return null;
-
 }
 
 // ============================================================
-// CLEAN VIDEO ID
+// CLEAN ID
 // ============================================================
 
 function cleanId(id) {
-
   return String(id || '')
     .replace(/[^A-Za-z0-9_-]/g, '')
     .slice(0, 64);
-
 }
 
 // ============================================================
-// ADMIN AUTHORIZATION
+// ADMIN AUTH
 // ============================================================
 
 function adminAuthorized(req) {
-
   const expected =
     process.env.ADMIN_TOKEN;
 
@@ -238,7 +189,6 @@ function adminAuthorized(req) {
     req.get('x-spitz-admin-token') || '';
 
   return supplied === expected;
-
 }
 
 // ============================================================
@@ -246,7 +196,6 @@ function adminAuthorized(req) {
 // ============================================================
 
 async function runFfmpeg(input, output) {
-
   return new Promise(
     (resolve, reject) => {
 
@@ -254,7 +203,6 @@ async function runFfmpeg(input, output) {
         'ffmpeg',
         [
           '-y',
-
           '-i',
           input,
 
@@ -278,7 +226,6 @@ async function runFfmpeg(input, output) {
 
           output
         ],
-
         {
           stdio: [
             'ignore',
@@ -288,46 +235,35 @@ async function runFfmpeg(input, output) {
         }
       );
 
-      let err = '';
+      let errorText = '';
 
       p.stderr.on(
         'data',
-        b => {
+        data => {
+          errorText += data.toString();
 
-          err += b.toString();
-
-          if (err.length > 8000) {
-
-            err =
-              err.slice(-8000);
-
+          if (errorText.length > 8000) {
+            errorText =
+              errorText.slice(-8000);
           }
-
         }
       );
 
-      p.on(
-        'error',
-        reject
-      );
+      p.on('error', reject);
 
       p.on(
         'close',
         code => {
 
           if (code === 0) {
-
             resolve();
-
           } else {
-
             reject(
               new Error(
                 'FFmpeg failed: ' +
-                err
+                errorText
               )
             );
-
           }
 
         }
@@ -335,7 +271,6 @@ async function runFfmpeg(input, output) {
 
     }
   );
-
 }
 
 // ============================================================
@@ -355,7 +290,6 @@ function libraryItem(id) {
   if (item.externalUrl) {
 
     return {
-
       videoId: id,
 
       title:
@@ -377,10 +311,8 @@ function libraryItem(id) {
         item.externalUrl,
 
       source:
-        'michaelbelgium-youtube-api'
-
+        'self-hosted-converter'
     };
-
   }
 
   // Local MP4
@@ -394,13 +326,10 @@ function libraryItem(id) {
     !item.file ||
     !fs.existsSync(absolute)
   ) {
-
     return null;
-
   }
 
   return {
-
     videoId: id,
 
     title:
@@ -425,9 +354,7 @@ function libraryItem(id) {
 
     source:
       'spitz-x-local-library'
-
   };
-
 }
 
 // ============================================================
@@ -437,44 +364,26 @@ function libraryItem(id) {
 app.get('/', (req, res) => {
 
   res.json({
+    name: 'SPITz-X API',
 
-    name:
-      'SPITz-X API',
+    status: 'online',
 
-    status:
-      'online',
-
-    version:
-      '4.0.0',
+    version: '4.1.0',
 
     services: {
-
-      analyze:
-        '/analyze',
-
-      library:
-        '/library/:videoId',
-
+      analyze: '/analyze',
+      library: '/library/:videoId',
       youtubeConvert:
         '/admin/youtube-convert',
-
       adminUpload:
         '/admin/upload',
-
-      media:
-        '/media/:videoId',
-
+      process: '/process',
+      convert: '/convert',
+      media: '/media/:videoId',
       download:
         '/media/:videoId/download',
-
-      process:
-        '/process',
-
-      health:
-        '/health'
-
+      health: '/health'
     }
-
   });
 
 });
@@ -487,21 +396,20 @@ app.get('/health', (req, res) => {
 
   res.json({
 
-    status:
-      'ok',
+    status: 'ok',
 
     service:
       'SPITz-X API',
 
     version:
-      '4.0.0',
+      '4.1.0',
 
     processor:
       'ffmpeg',
 
-    youtubeConverterConfigured:
+    converterConfigured:
       Boolean(
-        YOUTUBE_CONVERTER_TOKEN
+        YOUTUBE_CONVERTER_BASE
       ),
 
     libraryItems:
@@ -518,7 +426,7 @@ app.get('/health', (req, res) => {
 });
 
 // ============================================================
-// YOUTUBE METADATA
+// ANALYZE YOUTUBE URL
 // ============================================================
 
 app.get('/analyze', async (req, res) => {
@@ -542,7 +450,7 @@ app.get('/analyze', async (req, res) => {
 
   try {
 
-    const o =
+    const response =
       await fetch(
         'https://www.youtube.com/oembed?format=json&url=' +
         encodeURIComponent(
@@ -551,7 +459,7 @@ app.get('/analyze', async (req, res) => {
         )
       );
 
-    if (!o.ok) {
+    if (!response.ok) {
 
       return res
         .status(502)
@@ -563,7 +471,7 @@ app.get('/analyze', async (req, res) => {
     }
 
     const data =
-      await o.json();
+      await response.json();
 
     const copy =
       libraryItem(id);
@@ -583,7 +491,7 @@ app.get('/analyze', async (req, res) => {
 
     });
 
-  } catch (_) {
+  } catch (err) {
 
     res
       .status(502)
@@ -597,7 +505,7 @@ app.get('/analyze', async (req, res) => {
 });
 
 // ============================================================
-// CHECK LIBRARY
+// LIBRARY LOOKUP
 // ============================================================
 
 app.get(
@@ -622,19 +530,15 @@ app.get(
             false,
 
           error:
-            'No authorized MP4 copy is registered for this video.'
+            'No MP4 copy is registered for this video.'
 
         });
 
     }
 
     res.json({
-
-      available:
-        true,
-
+      available: true,
       ...item
-
     });
 
   }
@@ -644,17 +548,9 @@ app.get(
 // ADMIN YOUTUBE → MP4
 // ============================================================
 //
-// This is the endpoint your SPITz-X frontend calls.
-//
-// POST /admin/youtube-convert
-//
-// Header:
-// x-spitz-admin-token: YOUR_ADMIN_TOKEN
-//
-// Body:
-// {
-//   "videoUrl": "https://www.youtube.com/watch?v=..."
-// }
+// The converter itself must be separately self-hosted/configured.
+// SPITz-X only sends the URL to that service and registers the
+// returned MP4 URL.
 //
 // ============================================================
 
@@ -662,10 +558,7 @@ app.post(
   '/admin/youtube-convert',
   async (req, res) => {
 
-    // -----------------------------
-    // Check admin token
-    // -----------------------------
-
+    // Admin check
     if (!adminAuthorized(req)) {
 
       return res
@@ -677,10 +570,21 @@ app.post(
 
     }
 
-    // -----------------------------
-    // Get URL
-    // -----------------------------
+    // Converter configuration
+    if (!YOUTUBE_CONVERTER_BASE) {
 
+      return res
+        .status(503)
+        .json({
+
+          error:
+            'Self-hosted YouTube converter is not configured. Set YOUTUBE_CONVERTER_BASE on the SPITz-X API server.'
+
+        });
+
+    }
+
+    // YouTube URL
     const suppliedUrl =
       String(
         req.body.videoUrl || ''
@@ -704,76 +608,50 @@ app.post(
 
     }
 
-    // -----------------------------
-    // Check converter token
-    // -----------------------------
-
-    if (
-      !YOUTUBE_CONVERTER_TOKEN
-    ) {
-
-      return res
-        .status(503)
-        .json({
-
-          error:
-            'YouTube converter is not configured on the server. Set YOUTUBE_CONVERTER_TOKEN.'
-
-        });
-
-    }
-
     try {
 
-      // ---------------------------
-      // Build converter request
-      // ---------------------------
+      // --------------------------------------------------------
+      // Send the URL to the configured converter.
+      //
+      // This expects the converter service to expose an endpoint
+      // that accepts a YouTube URL and returns an MP4 URL.
+      // --------------------------------------------------------
 
-      const endpoint =
+      const converterUrl =
         new URL(
-          '/convert.php',
+          '/convert',
           YOUTUBE_CONVERTER_BASE
         );
 
-      endpoint.searchParams.set(
-        'youtubelink',
-        suppliedUrl
-      );
-
-      endpoint.searchParams.set(
-        'format',
-        'mp4'
-      );
-
-      endpoint.searchParams.set(
-        YOUTUBE_CONVERTER_TOKEN_PARAM,
-        YOUTUBE_CONVERTER_TOKEN
-      );
-
-      console.log(
-        'Requesting authorized YouTube conversion for:',
-        id
-      );
-
-      // ---------------------------
-      // Call converter
-      // ---------------------------
-
-      const upstream =
+      const converterResponse =
         await fetch(
-          endpoint
+          converterUrl,
+          {
+            method: 'POST',
+
+            headers: {
+              'content-type':
+                'application/json'
+            },
+
+            body: JSON.stringify({
+              url:
+                suppliedUrl,
+
+              format:
+                'mp4'
+            })
+          }
         );
 
       const text =
-        await upstream.text();
+        await converterResponse.text();
 
       let data;
 
       try {
-
         data =
           JSON.parse(text);
-
       } catch (_) {
 
         return res
@@ -781,19 +659,14 @@ app.post(
           .json({
 
             error:
-              'Converter returned a non-JSON response.'
+              'Converter returned an invalid response.'
 
           });
 
       }
 
-      // ---------------------------
-      // Converter error
-      // ---------------------------
-
       if (
-        !upstream.ok ||
-        data.error
+        !converterResponse.ok
       ) {
 
         return res
@@ -801,33 +674,32 @@ app.post(
           .json({
 
             error:
-              data.message ||
-              'The YouTube converter rejected the request.'
+              data.error ||
+              'Converter rejected the request.'
 
           });
 
       }
 
-      // ---------------------------
-      // MP4 URL
-      // ---------------------------
+      // Accept common response field names
+      const mp4Url =
+        data.file ||
+        data.url ||
+        data.downloadUrl ||
+        data.download_url;
 
-      if (!data.file) {
+      if (!mp4Url) {
 
         return res
           .status(502)
           .json({
 
             error:
-              'Converter did not return an MP4 file URL.'
+              'Converter did not return an MP4 URL.'
 
           });
 
       }
-
-      // ---------------------------
-      // Save in library
-      // ---------------------------
 
       const title =
         String(
@@ -835,6 +707,7 @@ app.post(
           'SPITz-X Video'
         ).slice(0, 200);
 
+      // Save it to SPITz-X library
       appData.library.set(
         id,
         {
@@ -842,16 +715,19 @@ app.post(
           title,
 
           channel:
-            '',
+            String(
+              data.channel ||
+              ''
+            ).slice(0, 200),
 
           filename:
             id + '.mp4',
 
           externalUrl:
-            data.file,
+            mp4Url,
 
           source:
-            'michaelbelgium-youtube-api',
+            'self-hosted-converter',
 
           updatedAt:
             new Date()
@@ -861,10 +737,6 @@ app.post(
       );
 
       await saveLibrary();
-
-      // ---------------------------
-      // Return to frontend
-      // ---------------------------
 
       res.json({
 
@@ -876,25 +748,21 @@ app.post(
 
         title,
 
-        duration:
-          data.duration ||
-          null,
-
         url:
-          data.file,
+          mp4Url,
 
         downloadUrl:
-          data.file,
+          mp4Url,
 
         source:
-          'michaelbelgium-youtube-api'
+          'self-hosted-converter'
 
       });
 
     } catch (err) {
 
       console.error(
-        'YouTube conversion error:',
+        'Converter error:',
         err
       );
 
@@ -904,7 +772,7 @@ app.post(
 
           error:
             err.message ||
-            'Could not reach the configured YouTube converter.'
+            'Could not connect to the self-hosted converter.'
 
         });
 
@@ -949,10 +817,8 @@ app.post(
       return res
         .status(400)
         .json({
-
           error:
             'Upload a video in the video field.'
-
         });
 
     }
@@ -982,10 +848,8 @@ app.post(
       return res
         .status(400)
         .json({
-
           error:
-            'Provide a valid YouTube watch URL or video ID.'
-
+            'Provide a YouTube URL or video ID.'
         });
 
     }
@@ -1011,18 +875,15 @@ app.post(
         filename
       );
 
-    const tempPath =
-      req.file.path;
-
     try {
 
       await runFfmpeg(
-        tempPath,
+        req.file.path,
         finalPath
       );
 
       await fsp.rm(
-        tempPath,
+        req.file.path,
         {
           force: true
         }
@@ -1050,8 +911,7 @@ app.post(
 
       res.json({
 
-        ok:
-          true,
+        ok: true,
 
         videoId:
           id,
@@ -1074,7 +934,7 @@ app.post(
     } catch (err) {
 
       await fsp.rm(
-        tempPath,
+        req.file.path,
         {
           force: true
         }
@@ -1116,23 +976,18 @@ app.post(
       return res
         .status(400)
         .json({
-
           error:
             'Upload a video in the video field.'
-
         });
 
     }
 
-    const suppliedUrl =
-      String(
-        req.body.videoUrl || ''
-      );
-
     const id =
       cleanId(
         youtubeId(
-          suppliedUrl
+          String(
+            req.body.videoUrl || ''
+          )
         ) ||
         req.body.videoId
       );
@@ -1149,10 +1004,8 @@ app.post(
       return res
         .status(400)
         .json({
-
           error:
-            'Provide the YouTube watch URL or video ID.'
-
+            'Provide a YouTube URL or video ID.'
         });
 
     }
@@ -1189,11 +1042,9 @@ app.post(
       appData.library.set(
         id,
         {
-
           title,
 
-          channel:
-            '',
+          channel: '',
 
           file:
             filename,
@@ -1201,7 +1052,6 @@ app.post(
           updatedAt:
             new Date()
               .toISOString()
-
         }
       );
 
@@ -1209,8 +1059,7 @@ app.post(
 
       res.json({
 
-        ok:
-          true,
+        ok: true,
 
         videoId:
           id,
@@ -1260,7 +1109,7 @@ app.post(
 );
 
 // ============================================================
-// CONVERT COMPATIBILITY ROUTE
+// COMPATIBILITY CONVERT ROUTE
 // ============================================================
 
 app.post(
@@ -1273,23 +1122,18 @@ app.post(
       return res
         .status(400)
         .json({
-
           error:
             'Upload a video in the video field.'
-
         });
 
     }
 
-    const suppliedUrl =
-      String(
-        req.body.videoUrl || ''
-      );
-
     const id =
       cleanId(
         youtubeId(
-          suppliedUrl
+          String(
+            req.body.videoUrl || ''
+          )
         ) ||
         req.body.videoId
       );
@@ -1306,19 +1150,11 @@ app.post(
       return res
         .status(400)
         .json({
-
           error:
-            'Provide the YouTube watch URL or video ID.'
-
+            'Provide a YouTube URL or video ID.'
         });
 
     }
-
-    const title =
-      String(
-        req.body.title ||
-        'SPITz-X Video'
-      ).slice(0, 200);
 
     const filename =
       id + '.mp4';
@@ -1347,10 +1183,13 @@ app.post(
         id,
         {
 
-          title,
+          title:
+            String(
+              req.body.title ||
+              'SPITz-X Video'
+            ).slice(0, 200),
 
-          channel:
-            '',
+          channel: '',
 
           file:
             filename,
@@ -1366,13 +1205,10 @@ app.post(
 
       res.json({
 
-        ok:
-          true,
+        ok: true,
 
         videoId:
           id,
-
-        title,
 
         url:
           '/media/' +
@@ -1407,7 +1243,7 @@ app.post(
 
           error:
             err.message ||
-            'Video processing failed.'
+            'Video conversion failed.'
 
         });
 
@@ -1417,7 +1253,7 @@ app.post(
 );
 
 // ============================================================
-// SEND VIDEO
+// MEDIA SERVING
 // ============================================================
 
 function sendVideo(
@@ -1460,19 +1296,13 @@ function sendVideo(
       item.file
     );
 
-  if (
-    !fs.existsSync(
-      absolute
-    )
-  ) {
+  if (!fs.existsSync(absolute)) {
 
     return res
       .status(404)
       .json({
-
         error:
           'Media file is unavailable.'
-
       });
 
   }
@@ -1487,7 +1317,6 @@ function sendVideo(
         ? 'attachment'
         : 'inline'
     ) +
-
     '; filename="' +
     id +
     '.mp4"'
@@ -1498,23 +1327,6 @@ function sendVideo(
   );
 
 }
-
-// ============================================================
-// MEDIA DOWNLOAD
-// ============================================================
-
-app.get(
-  '/media/:videoId/download',
-  (req, res) => {
-
-    sendVideo(
-      req,
-      res,
-      true
-    );
-
-  }
-);
 
 // ============================================================
 // MEDIA PLAYER
@@ -1534,7 +1346,24 @@ app.get(
 );
 
 // ============================================================
-// START SERVER
+// DOWNLOAD
+// ============================================================
+
+app.get(
+  '/media/:videoId/download',
+  (req, res) => {
+
+    sendVideo(
+      req,
+      res,
+      true
+    );
+
+  }
+);
+
+// ============================================================
+// START
 // ============================================================
 
 app.listen(
@@ -1543,12 +1372,13 @@ app.listen(
   () => {
 
     console.log(
-      `SPITz-X API listening on 0.0.0.0:${PORT}`
+      `SPITz-X API listening on port ${PORT}`
     );
 
     console.log(
-      'YouTube converter:',
-      YOUTUBE_CONVERTER_BASE
+      'Converter:',
+      YOUTUBE_CONVERTER_BASE ||
+      'NOT CONFIGURED'
     );
 
   }
